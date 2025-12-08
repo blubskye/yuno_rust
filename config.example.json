@@ -1,0 +1,12 @@
+{
+    "discord_token": "YOUR_DISCORD_BOT_TOKEN_HERE",
+    "default_prefix": ".",
+    "database_path": "yuno.db",
+    "master_users": [
+        "YOUR_USER_ID_HERE"
+    ],
+    "spam_max_warnings": 3,
+    "ban_default_image": null,
+    "dm_message": "I'm just a bot :'(. I can't answer to you.",
+    "insufficient_permissions_message": "${author} You don't have permission to do that~"
+}
