@@ -105,10 +105,11 @@ async fn handle_violation(
             .await?;
 
         // Record to database
+        let bot_user_id = ctx.cache.current_user().id.get();
         data.db
             .add_mod_action(
                 member.guild_id.get(),
-                ctx.cache.current_user().id.get(),
+                bot_user_id,
                 user_id,
                 "ban",
                 Some(&format!("Autobanned: {}", reason)),

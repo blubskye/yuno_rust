@@ -86,7 +86,7 @@ async fn main() -> Result<()> {
                 prefix: Some(default_prefix),
                 dynamic_prefix: Some(|ctx| {
                     Box::pin(async move {
-                        let data = ctx.data();
+                        let data = ctx.data;
                         if let Some(guild_id) = ctx.guild_id {
                             if let Ok(Some(prefix)) = data.db.get_prefix(guild_id.get()).await {
                                 return Ok(Some(prefix));
@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
         | serenity::GatewayIntents::GUILD_MESSAGES
         | serenity::GatewayIntents::MESSAGE_CONTENT
         | serenity::GatewayIntents::DIRECT_MESSAGES
-        | serenity::GatewayIntents::GUILD_BANS;
+        | serenity::GatewayIntents::GUILD_MODERATION;
 
     info!("Connecting to Discord...");
     let mut client = serenity::ClientBuilder::new(&token, intents)

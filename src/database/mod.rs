@@ -19,9 +19,71 @@
 
 use anyhow::Result;
 use sqlx::{sqlite::SqlitePoolOptions, Pool, Sqlite};
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 pub struct Database {
     pool: Pool<Sqlite>,
+    // XP batching
+    pending_xp: Arc<Mutex<HashMap<String, PendingXp>>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PendingXp {
+    pub user_id: u64,
+    pub guild_id: u64,
+    pub channel_id: u64,
+    pub xp_amount: i64,
+    pub added_at: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoiceXpConfig {
+    pub guild_id: u64,
+    pub enabled: bool,
+    pub xp_per_minute: i32,
+    pub min_users: i32,
+    pub ignore_afk: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActivityLog {
+    pub id: i64,
+    pub guild_id: u64,
+    pub user_id: u64,
+    pub channel_id: u64,
+    pub event_type: String,
+    pub old_content: Option<String>,
+    pub new_content: Option<String>,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DmInbox {
+    pub id: i64,
+    pub user_id: u64,
+    pub username: String,
+    pub content: String,
+    pub timestamp: i64,
+    pub read_status: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct BotBan {
+    pub user_id: u64,
+    pub banned_by: u64,
+    pub reason: Option<String>,
+    pub timestamp: i64,
+}
+
+impl Clone for Database {
+    fn clone(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            pending_xp: Arc::clone(&self.pending_xp),
+        }
+    }
 }
 
 impl Database {
@@ -31,7 +93,10 @@ impl Database {
             .connect(&format!("sqlite:{}?mode=rwc", path))
             .await?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            pending_xp: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
     pub async fn init(&self) -> Result<()> {
@@ -148,6 +213,78 @@ impl Database {
         sqlx::query("CREATE INDEX IF NOT EXISTS idx_mod_actions_moderator ON mod_actions(guild_id, moderator_id)")
             .execute(&self.pool)
             .await?;
+
+        // Voice XP config table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS voice_xp_config (
+                guild_id TEXT PRIMARY KEY,
+                enabled INTEGER DEFAULT 0,
+                xp_per_minute INTEGER DEFAULT 5,
+                min_users INTEGER DEFAULT 2,
+                ignore_afk INTEGER DEFAULT 1
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+
+        // Activity log table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id INTEGER PRIMARY KEY,
+                guild_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                channel_id TEXT,
+                event_type TEXT NOT NULL,
+                old_content TEXT,
+                new_content TEXT,
+                timestamp INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_activity_guild ON activity_log(guild_id)")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_activity_timestamp ON activity_log(timestamp)")
+            .execute(&self.pool)
+            .await?;
+
+        // DM inbox table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS dm_inbox (
+                id INTEGER PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                username TEXT,
+                content TEXT,
+                timestamp INTEGER NOT NULL,
+                read_status INTEGER DEFAULT 0
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
+        sqlx::query("CREATE INDEX IF NOT EXISTS idx_dm_timestamp ON dm_inbox(timestamp)")
+            .execute(&self.pool)
+            .await?;
+
+        // Bot bans table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS bot_bans (
+                user_id TEXT PRIMARY KEY,
+                banned_by TEXT,
+                reason TEXT,
+                timestamp INTEGER NOT NULL
+            )
+            "#,
+        )
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
@@ -351,6 +488,254 @@ impl Database {
                 time_between_cleans: time_between,
                 warning_time: warning,
                 remaining_time: remaining,
+            })
+            .collect())
+    }
+
+    // XP Batching operations
+    pub async fn add_xp_to_batch(&self, user_id: u64, guild_id: u64, channel_id: u64, xp: i64) {
+        let key = format!("{}:{}", guild_id, user_id);
+        let mut pending = self.pending_xp.lock().await;
+
+        if let Some(entry) = pending.get_mut(&key) {
+            entry.xp_amount += xp;
+            entry.channel_id = channel_id;
+        } else {
+            pending.insert(
+                key,
+                PendingXp {
+                    user_id,
+                    guild_id,
+                    channel_id,
+                    xp_amount: xp,
+                    added_at: chrono::Utc::now().timestamp(),
+                },
+            );
+        }
+    }
+
+    pub async fn flush_xp_batch(&self) -> Result<Vec<(u64, u64, u64, i64, i64)>> {
+        let mut pending = self.pending_xp.lock().await;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let to_process: HashMap<String, PendingXp> = std::mem::take(&mut *pending);
+        drop(pending);
+
+        let mut level_ups = Vec::new();
+
+        for (_, xp_entry) in to_process {
+            let (current_xp, current_level) = self.get_xp(xp_entry.guild_id, xp_entry.user_id).await?;
+            let new_xp = current_xp + xp_entry.xp_amount;
+            let new_level = ((new_xp as f64) / 100.0).sqrt() as i64;
+
+            self.set_xp(xp_entry.guild_id, xp_entry.user_id, new_xp, new_level).await?;
+
+            if new_level > current_level {
+                level_ups.push((xp_entry.user_id, xp_entry.guild_id, xp_entry.channel_id, new_level, new_xp));
+            }
+        }
+
+        Ok(level_ups)
+    }
+
+    // Voice XP config operations
+    pub async fn get_voice_xp_config(&self, guild_id: u64) -> Result<VoiceXpConfig> {
+        let result: Option<(i32, i32, i32, i32)> = sqlx::query_as(
+            "SELECT enabled, xp_per_minute, min_users, ignore_afk FROM voice_xp_config WHERE guild_id = ?",
+        )
+        .bind(guild_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(result
+            .map(|(enabled, xp_per_min, min_users, ignore_afk)| VoiceXpConfig {
+                guild_id,
+                enabled: enabled != 0,
+                xp_per_minute: xp_per_min,
+                min_users,
+                ignore_afk: ignore_afk != 0,
+            })
+            .unwrap_or(VoiceXpConfig {
+                guild_id,
+                enabled: false,
+                xp_per_minute: 5,
+                min_users: 2,
+                ignore_afk: true,
+            }))
+    }
+
+    pub async fn set_voice_xp_config(&self, config: &VoiceXpConfig) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO voice_xp_config (guild_id, enabled, xp_per_minute, min_users, ignore_afk)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id) DO UPDATE SET
+                enabled = ?, xp_per_minute = ?, min_users = ?, ignore_afk = ?
+            "#,
+        )
+        .bind(config.guild_id.to_string())
+        .bind(config.enabled as i32)
+        .bind(config.xp_per_minute)
+        .bind(config.min_users)
+        .bind(config.ignore_afk as i32)
+        .bind(config.enabled as i32)
+        .bind(config.xp_per_minute)
+        .bind(config.min_users)
+        .bind(config.ignore_afk as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // Activity log operations
+    pub async fn log_activity(&self, log: &ActivityLog) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO activity_log (guild_id, user_id, channel_id, event_type, old_content, new_content, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(log.guild_id.to_string())
+        .bind(log.user_id.to_string())
+        .bind(log.channel_id.to_string())
+        .bind(&log.event_type)
+        .bind(&log.old_content)
+        .bind(&log.new_content)
+        .bind(log.timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_activity_logs(&self, guild_id: u64, limit: i64) -> Result<Vec<ActivityLog>> {
+        let results: Vec<(i64, String, String, String, Option<String>, Option<String>, i64)> =
+            sqlx::query_as(
+                "SELECT id, user_id, channel_id, event_type, old_content, new_content, timestamp FROM activity_log WHERE guild_id = ? ORDER BY timestamp DESC LIMIT ?",
+            )
+            .bind(guild_id.to_string())
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|(id, uid, cid, event_type, old_content, new_content, timestamp)| ActivityLog {
+                id,
+                guild_id,
+                user_id: uid.parse().unwrap_or(0),
+                channel_id: cid.parse().unwrap_or(0),
+                event_type,
+                old_content,
+                new_content,
+                timestamp,
+            })
+            .collect())
+    }
+
+    // DM inbox operations
+    pub async fn save_dm(&self, dm: &DmInbox) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT INTO dm_inbox (user_id, username, content, timestamp, read_status)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(dm.user_id.to_string())
+        .bind(&dm.username)
+        .bind(&dm.content)
+        .bind(dm.timestamp)
+        .bind(dm.read_status as i32)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_dms(&self, limit: i64) -> Result<Vec<DmInbox>> {
+        let results: Vec<(i64, String, Option<String>, Option<String>, i64, i32)> = sqlx::query_as(
+            "SELECT id, user_id, username, content, timestamp, read_status FROM dm_inbox ORDER BY timestamp DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|(id, uid, username, content, timestamp, read_status)| DmInbox {
+                id,
+                user_id: uid.parse().unwrap_or(0),
+                username: username.unwrap_or_default(),
+                content: content.unwrap_or_default(),
+                timestamp,
+                read_status: read_status != 0,
+            })
+            .collect())
+    }
+
+    pub async fn mark_dm_read(&self, dm_id: i64) -> Result<()> {
+        sqlx::query("UPDATE dm_inbox SET read_status = 1 WHERE id = ?")
+            .bind(dm_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_unread_dm_count(&self) -> Result<i64> {
+        let result: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dm_inbox WHERE read_status = 0")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(result.0)
+    }
+
+    // Bot ban operations
+    pub async fn add_bot_ban(&self, ban: &BotBan) -> Result<()> {
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO bot_bans (user_id, banned_by, reason, timestamp)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(ban.user_id.to_string())
+        .bind(ban.banned_by.to_string())
+        .bind(&ban.reason)
+        .bind(ban.timestamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn remove_bot_ban(&self, user_id: u64) -> Result<()> {
+        sqlx::query("DELETE FROM bot_bans WHERE user_id = ?")
+            .bind(user_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn is_bot_banned(&self, user_id: u64) -> Result<bool> {
+        let result: Option<(i64,)> = sqlx::query_as("SELECT 1 FROM bot_bans WHERE user_id = ?")
+            .bind(user_id.to_string())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(result.is_some())
+    }
+
+    pub async fn get_bot_bans(&self, limit: i64) -> Result<Vec<BotBan>> {
+        let results: Vec<(String, String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT user_id, banned_by, reason, timestamp FROM bot_bans ORDER BY timestamp DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(results
+            .into_iter()
+            .map(|(uid, banned_by, reason, timestamp)| BotBan {
+                user_id: uid.parse().unwrap_or(0),
+                banned_by: banned_by.parse().unwrap_or(0),
+                reason,
+                timestamp,
             })
             .collect())
     }
