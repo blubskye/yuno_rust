@@ -58,15 +58,18 @@ This is the **Rust port** of the original JavaScript version. Why Rust? *Because
 - 🛡️ Spam filter protection
 - 👑 Mod statistics tracking
 - 📊 Scan & import ban history
+- 🚫 Bot-level bans (cross-guild blocking)
 
 </td>
 <td width="50%">
 
 ### ✨ Leveling System
 *"Watch me make you stronger, senpai~"*
-- 📊 XP & Level tracking
+- 📊 XP & Level tracking with batching
 - 🎭 Role rewards per level
 - 🏆 Server leaderboards
+- 🎤 Voice XP configuration
+- 📝 Activity logging
 
 </td>
 </tr>
@@ -108,8 +111,29 @@ This is the **Rust port** of the original JavaScript version. Why Rust? *Because
 *"Nothing can slow me down~"*
 - 📈 Async/await with Tokio
 - 💨 SQLite with sqlx
-- 🧠 Efficient caching
+- 🧠 Efficient caching & XP batching
 - 🎯 Native binary speed
+
+</td>
+</tr>
+<tr>
+<td width="50%">
+
+### 📬 DM Inbox
+*"I read every message you send me~"*
+- 💌 Stores all DMs received
+- 📖 Read/unread tracking
+- 🔔 Console notifications
+
+</td>
+<td width="50%">
+
+### 💻 Terminal Interface
+*"Control me from the command line~"*
+- 🖥️ Interactive admin console
+- 📊 Server & status monitoring
+- 🚫 Bot ban management
+- 📬 DM inbox viewer
 
 </td>
 </tr>
@@ -184,6 +208,25 @@ cargo run --release
 | `/source` | *"See how I was made~"* 📜 |
 
 *Use `/help` to see all available commands!*
+
+---
+
+## 💻 Terminal Commands
+
+*"I'll listen to your every command~"* 🖥️
+
+When running, Yuno provides an interactive terminal interface:
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show available terminal commands |
+| `servers` | List all connected Discord servers |
+| `inbox [count]` | View DM inbox (marks as read) |
+| `botban <user_id> [reason]` | Ban a user from using the bot |
+| `botunban <user_id>` | Remove a bot-level ban |
+| `botbanlist` | List all bot-banned users |
+| `status` | Show bot connection status |
+| `quit` / `exit` | Shutdown the bot gracefully |
 
 ---
 
